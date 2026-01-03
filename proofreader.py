@@ -211,9 +211,9 @@ class ProofreaderTool:
             f.write(file_content)
 
         # Print to console
-        console.print(table)
-        console.print(f"\n[bold]Total errors found:[/bold] {len(corrections)}")
-        console.print(f"[bold yellow]Results also saved to:[/bold yellow] {output_file}")
+        # console.print(table)
+        # console.print(f"\n[bold]Total errors found:[/bold] {len(corrections)}")
+        console.print(f"[bold yellow]Results saved to:[/bold yellow] {output_file}")
 
 if __name__ == "__main__":
     import sys
