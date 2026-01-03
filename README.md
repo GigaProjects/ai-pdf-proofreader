@@ -8,7 +8,7 @@ High accuracy PDF proofreading tool using Gemini AI. Features automated text cle
 - Cleans PDF artifacts like hyphenated line breaks and orphaned page numbers.
 - Processes text in parallel for high speed.
 - Supports configurable languages.
-- Exports results to both terminal and a timestamped file.
+- Exports results to a timestamped file.
 
 ## Installation
 
@@ -47,4 +47,5 @@ The tool provides a table in the console showing:
 - Corrected sentence
 
 The same results are automatically saved to a file named `results_[filename]_[timestamp].txt`.
+
 
