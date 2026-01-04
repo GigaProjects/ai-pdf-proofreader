@@ -1,0 +1,4 @@
+google-genai
+PyPDF2
+rich
+python-dotenv
