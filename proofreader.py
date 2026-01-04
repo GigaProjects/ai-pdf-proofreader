@@ -19,12 +19,26 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8')
 
 # --- CONFIGURATION VARIABLES ---
-CHUNK_LENGTH = 3000  # Detailed chunk length (approx characters)
-MODEL_SELECTED = "gemini-flash-latest" 
-MAX_PARALLEL_REQUESTS = 20 # Adjust based on your API tier limits
+CHUNK_LENGTH = 3000      # Detailed chunk length (approx characters)
 PROOFREAD_LANGUAGE = "English"
+MAX_PARALLEL_REQUESTS = 20 # Parallel workers for Fast Scan (Flash)
+MAX_PARALLEL_SMART = 5     # Parallel workers for Smart Verify (Pro) - keep low for rate limits
+VERIFICATION_BATCH_SIZE = 20 # Number of corrections to verify at once per request
+ENABLE_VERIFICATION = True # Set to False to skip the second pass and save costs
 
-SYSTEM_PROMPT = f"""You are an expert {PROOFREAD_LANGUAGE} proofreader. 
+# --- MODEL CONFIGURATION ---
+MODEL_FAST = "gemini-flash-latest"   # For initial proofreading (Speed/Cost)
+MODEL_SMART = "gemini-flash-latest"       # For verification (Accuracy) use "gemini-2.5-pro" for best results
+
+# --- DYNAMIC PROMPT EXAMPLES ---
+# Default to English examples for simplicity
+curr_ex = {
+    "orig": "This is example statement.",
+    "corr": "This is an example statement.",
+    "word1": "work-"
+}
+
+SYSTEM_PROMPT_FLASH = f"""You are an expert {PROOFREAD_LANGUAGE} proofreader. 
 Your task is to read the provided text and identify grammatical, spelling, and stylistic errors.
 For each error found, provide the:
 1. 'original_sentence': The complete sentence containing the error.
@@ -33,18 +47,38 @@ For each error found, provide the:
 Return the result as a JSON object with a list under the key "corrections". 
 If no errors are found, return an empty list.
 Example format:
-{
+{{
   "corrections": [
-    {
-      "original_sentence": "This is example statement.",
-      "correction": "This is an example statement."
-    }
+    {{
+      "original_sentence": "{curr_ex['orig']}",
+      "correction": "{curr_ex['corr']}"
+    }}
   ]
-}
+}}
 
 IMPORTANT: Some lines in the input might be broken by hyphens (e.g. 'work-' followed by 'flow'). Treat these as a single word. 
 Also, ignore errors that are obviously formatting artifacts from PDF extraction (like page numbers or single letters split from words).
+
+The text is processed in chunks, so sentences will often start mid-sentence with a lowercase letter or end abruptly without a period. 
+DO NOT flag these as errors. Only correct legitimate grammar and spelling mistakes.
 If a sentence is correct despite formatting oddities, do not flag it.
+"""
+
+SYSTEM_PROMPT_PRO = f"""
+You are a quality control assistant for a proofreading tool.
+Your task is to review a list of suggested corrections and FILTER OUT false positives.
+
+A "False Positive" is a correction that:
+1. Is caused purely by PDF parsing errors (e.g., a word split by a newline '{curr_ex['word1']} \\n' -> '{curr_ex['word1'][:-1]}' which looks like a space insertion but isn't a grammar error).
+2. Is changing a number or page number that shouldn't be there (e.g. removing a stray '23').
+3. Is "correcting" a sentence that was actually cut off or formatting garbage.
+4. IS CORRECTING A LOWERCASE START OR MISSING PERIOD caused by chunk splitting. Chunks start/end mid-sentence; ignore these.
+
+KEEP only corrections that are legitimate spelling, grammar, or stylistic errors.
+
+IMPORTANT: You must return the JSON objects for the valid items EXACTLY as they appear in the input. Do not modify the text or invent new corrections.
+
+Return a JSON object with a single key "verified_corrections" containing ONLY the valid items from the input list.
 """
 
 # --- SETUP ---
@@ -80,37 +114,47 @@ class ProofreaderTool:
             return []
 
     def clean_text(self, text):
-        """Clean PDF artifacts: merge hyphenated broken words and remove page numbers."""
-        # 1. Merge hyphenated words at line breaks.
-        # Handle formats like 'word- \n next', 'word - \n next', and 'word - next' (if newline was lost)
-        # This regex looks for a word char, followed by optional spaces, a hyphen, 
-        # then either a newline with optional surrounding whitespace OR at least one space.
-        # We replace it with just the captured word chars.
-        
-        # Pattern 1: Hyphen followed by newline (standard line break)
+        # 1. Merge hyphenated words and handling soft hyphens
         text = re.sub(r'(\w)\s*[-\xad]\s*\n\s*(\w)', r'\1\2', text)
-        
-        # Pattern 2: Hyphen followed by spaces (where newline might have been stripped by extraction)
         text = re.sub(r'(\w)\s*[-\xad]\s+(\w)', r'\1\2', text)
         
-        # 2. Heuristic for page numbers: remove lines that are ONLY digits 
-        # (common for headers/footers in simple PDF extractions)
+        # 2. Heuristic for page numbers and headers/footers
         lines = text.split('\n')
         cleaned_lines = []
         for i, line in enumerate(lines):
             stripped = line.strip()
-            # If line is just a number and it's near the start or end of the page text
-            if stripped.isdigit() and (i < 3 or i > len(lines) - 4):
-                continue 
+            
+            # Skip lines that look like page numbers or headers
+            # 1. Just digits
+            if stripped.isdigit():
+                continue
+            
+            # 2. "Page X" or "X / Y" format
+            # Check for specific patterns rather than just "any digit"
+            if re.match(r'^(page|stran)\s*\d+$', stripped.lower()) or re.match(r'^\d+\s*/\s*\d+$', stripped):
+                continue
+
+            # 3. Very short lines with digits that aren't sentences (e.g. "2023", "Unit 1")
+            # Only remove if it doesn't end with sentence punctuation
+            if len(stripped) < 10 and any(c.isdigit() for c in stripped):
+                if not stripped.endswith(('.', '!', '?', ':', ';')):
+                     continue
+                # If it's short and has numbers, it's suspicious. Check if it's NOT a sentence.
+                if not stripped.endswith(('.', '!', '?')):
+                    continue
+
             cleaned_lines.append(line)
         
         text = "\n".join(cleaned_lines)
 
-        # 3. Remove digits that got stuck to the end of the last word or start of first word
-        # (e.g., 'beseda12' -> 'beseda' at the very end of a page)
-        text = re.sub(r'(\w)\d+$', r'\1', text.strip()) # End of text
-        text = re.sub(r'^\d+(\w)', r'\1', text)         # Start of text
-            
+        # 3. Aggressive "Sticky Number" Removal
+        # Remove digits attached to the end of words (e.g., "beseda123" -> "beseda")
+        # We assume specific Slovenian lowercase letters to avoid stripping real citations like "Model T5"
+        text = re.sub(r'([a-zčšž])\d+\b', r'\1', text) 
+        
+        # Remove digits at the start of words (e.g., "123beseda" -> "beseda")
+        text = re.sub(r'\b\d+([a-zčšž])', r'\1', text)
+
         return text
 
 
@@ -129,22 +173,35 @@ class ProofreaderTool:
                  chunks.append({"pages": [page_num], "text": page_text})
         return chunks
 
+    @staticmethod
+    def _call_with_retry(func, *args, retries=3, **kwargs):
+        """Helper to retry API calls with exponential backoff."""
+        import time
+        for attempt in range(retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                if attempt == retries - 1: raise e
+                time.sleep(2 ** attempt) # Exponential backoff: 1s, 2s, 4s
+
     def proofread_chunk(self, chunk):
         """Sends a single chunk to Gemini and returns corrections with page info."""
         try:
-            response = self.client.models.generate_content(
-                model=MODEL_SELECTED,
-                contents=f"{SYSTEM_PROMPT}\n\nText to proofread:\n{chunk['text']}",
+            # Wrap API call with retry logic
+            response = self._call_with_retry(
+                self.client.models.generate_content,
+                model=MODEL_FAST,
+                contents=f"{SYSTEM_PROMPT_FLASH}\n\nText to proofread:\n{chunk['text']}",
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
+            
             result = json.loads(response.text)
             corrections = result.get("corrections", [])
             for c in corrections:
                 c["page"] = chunk["pages"][0]
             return corrections
         except Exception as e:
-            # Silently return empty on individual chunk errors to keep progress moving, 
-            # though we could log it to a separate error file.
+            # Return empty on persistent failure
             return []
 
     def run(self, pdf_path):
@@ -175,18 +232,87 @@ class ProofreaderTool:
                     result = future.result()
                     all_corrections.extend(result)
                     progress.update(task, advance=1)
-
-        # Sort by page number
-        all_corrections.sort(key=lambda x: x.get("page", 0))
         
-        # Generate dynamic filename
+        # Define base_name and timestamp before using them
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-        output_file = f"results_{base_name}_{timestamp}.txt"
-        
-        self.display_and_save_results(all_corrections, output_file)
 
-    def display_and_save_results(self, corrections, output_file):
+        if all_corrections:
+            # 1. Save Raw Results First
+            raw_output_file = f"results_{base_name}_{timestamp}_RAW.txt"
+            console.print(f"[yellow]Saving raw results to: {raw_output_file}...[/yellow]")
+            self.display_and_save_results(all_corrections, raw_output_file, show_console=False)
+
+            if ENABLE_VERIFICATION:
+                # 2. Verify with Smart Model (with progress bar)
+                final_results = self.verify_corrections(all_corrections)
+                final_suffix = "VERIFIED"
+            else:
+                # Skip verification and use raw corrections directly
+                console.print("[blue]Skipping Smart Verification (ENABLE_VERIFICATION is False)[/blue]")
+                final_results = all_corrections
+                final_suffix = "FAST"
+            
+            # Sort final results
+            final_results.sort(key=lambda x: x.get("page", 0))
+
+            # 3. Save Final Results
+            final_output_file = f"results_{base_name}_{timestamp}_{final_suffix}.txt"
+            self.display_and_save_results(final_results, final_output_file, show_console=True)
+            
+        else:
+             console.print("[green]No errors found![/green]")
+
+    def verify_corrections(self, corrections):
+        """
+        Sends the list of corrections back to the LLM in parallel to filter out false positives.
+        """
+        verified_corrections = []
+        total_items = len(corrections)
+        
+        # Create batches
+        batches = [corrections[i:i+VERIFICATION_BATCH_SIZE] for i in range(0, total_items, VERIFICATION_BATCH_SIZE)]
+        
+        def process_batch(batch):
+            prompt = f"""{SYSTEM_PROMPT_PRO}
+            
+            Input JSON list:
+            {json.dumps(batch, ensure_ascii=False)}
+            """
+            try:
+                # Wrap API call with retry logic
+                response = self._call_with_retry(
+                    self.client.models.generate_content,
+                    model=MODEL_SMART,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json")
+                )
+                result = json.loads(response.text)
+                return result.get("verified_corrections", [])
+            except Exception as e:
+                console.print(f"[yellow]Warning: Verification batch failed: {e}. Keeping original items.[/yellow]")
+                return batch
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task(f"Smart Verification ({MODEL_SMART})...", total=total_items)
+            
+            with ThreadPoolExecutor(max_workers=MAX_PARALLEL_SMART) as executor:
+                futures = {executor.submit(process_batch, b): b for b in batches}
+                
+                for future in as_completed(futures):
+                    batch_res = future.result()
+                    verified_corrections.extend(batch_res)
+                    progress.update(task, advance=len(futures[future]))
+                
+        return verified_corrections
+
+    def display_and_save_results(self, corrections, output_file, show_console=True):
         table = Table(title=f"{PROOFREAD_LANGUAGE} Proofreading Results: {output_file}", show_lines=True)
         table.add_column("Page", style="cyan", no_wrap=True)
         table.add_column("Original", style="red")
@@ -210,10 +336,12 @@ class ProofreaderTool:
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(file_content)
 
-        # Print to console
-        # console.print(table)
-        # console.print(f"\n[bold]Total errors found:[/bold] {len(corrections)}")
-        console.print(f"[bold yellow]Results saved to:[/bold yellow] {output_file}")
+        # Print summary to console
+        if show_console:
+            # console.print(table) # Uncomment if you want to see the full table for verified results
+            pass
+        
+        console.print(f"[bold yellow]Results saved to:[/bold yellow] {output_file} ([bold cyan]{len(corrections)} errors[/bold cyan])")
 
 if __name__ == "__main__":
     import sys
