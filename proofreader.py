@@ -24,7 +24,7 @@ PROOFREAD_LANGUAGE = "English"
 MAX_PARALLEL_REQUESTS = 20 # Parallel workers for Fast Scan (Flash)
 MAX_PARALLEL_SMART = 5     # Parallel workers for Smart Verify (Pro) - keep low for rate limits
 VERIFICATION_BATCH_SIZE = 20 # Number of corrections to verify at once per request
-ENABLE_VERIFICATION = True # Set to False to skip the second pass and save costs
+ENABLE_VERIFICATION = False # Set to False to skip the second pass and save costs
 
 # --- MODEL CONFIGURATION ---
 MODEL_FAST = "gemini-flash-latest"   # For initial proofreading (Speed/Cost)
@@ -238,12 +238,12 @@ class ProofreaderTool:
         base_name = os.path.splitext(os.path.basename(pdf_path))[0]
 
         if all_corrections:
-            # 1. Save Raw Results First
-            raw_output_file = f"results_{base_name}_{timestamp}_RAW.txt"
-            console.print(f"[yellow]Saving raw results to: {raw_output_file}...[/yellow]")
-            self.display_and_save_results(all_corrections, raw_output_file, show_console=False)
-
             if ENABLE_VERIFICATION:
+                # 1. Save Raw Results First (Only if we are going to verify afterward)
+                raw_output_file = f"results_{base_name}_{timestamp}_RAW.txt"
+                console.print(f"[yellow]Saving raw results to: {raw_output_file}...[/yellow]")
+                self.display_and_save_results(all_corrections, raw_output_file, show_console=False)
+
                 # 2. Verify with Smart Model (with progress bar)
                 final_results = self.verify_corrections(all_corrections)
                 final_suffix = "VERIFIED"
